@@ -1,0 +1,11 @@
+[package]
+name = "easy-map"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+haphazard = { path = "../haphazard/" }
+ahash = "0.7.6"
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.5.5"
