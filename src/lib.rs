@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use haphazard::{AtomicPtr, Domain, HazardPointer};
 
@@ -119,64 +119,69 @@ where
     pub fn insert(&self, key: K, value: V) -> Option<V> {
         // SAFETY: `p` is null
         let next = unsafe { AtomicPtr::new(std::ptr::null_mut()) };
-        let mut new_node = Some(Box::new(Node { key, value, next }));
-        let index = self.index_for_key(&new_node.as_ref().unwrap().key);
+        let new_node = Box::into_raw(Box::new(Node { key, value, next }));
+        println!("allocated new node {:?}", new_node);
+        let index = {
+            // never shared
+            let new_node = unsafe { &*new_node };
+            self.index_for_key(&new_node.key)
+        };
         let bucket = &self.buckets[index];
 
         loop {
-            let mut second_guard = None;
-            let new_node_ref = new_node.as_mut().unwrap();
+            let (ptr, current, _guard) = {
+                println!("getting hazard pointer");
+                let mut guard = HazardPointer::new_in_domain(&self.domain);
+                let maybe_root_node = bucket.0.protect_ptr(&mut guard);
+                println!("protected hazard pointer");
+                // never shared
+                let new_node = unsafe { &*new_node };
 
-            let mut guard = HazardPointer::new_in_domain(&self.domain);
-            let maybe_root_node = bucket.0.protect_ptr(&mut guard);
+                match maybe_root_node {
+                    Some((root_node, _)) => {
+                        match self.find_matching_key(&bucket.0, guard, root_node, &new_node.key) {
+                            Ok((ptr, guard, match_ptr)) => {
+                                println!("found matching key");
+                                // copy the rest of the chain after the old node
+                                let next = unsafe { match_ptr.as_ref() }.next.load_ptr();
+                                // never shared
+                                unsafe { new_node.next.store_ptr(next) };
 
-            let (ptr, current, _guard) = match maybe_root_node {
-                Some((root_node, _)) => {
-                    match self.find_matching_key(&bucket.0, guard, root_node, &new_node_ref.key) {
-                        Ok((ptr, guard, match_ptr)) => {
-                            // We found a match, swap the found node out with this one
-                            second_guard = Some(HazardPointer::new_in_domain(&self.domain));
-
-                            // Find the next of the old node
-                            let next = unsafe { match_ptr.as_ref() }
-                                .next
-                                .protect_ptr(second_guard.as_mut().unwrap());
-
-                            let next = next
-                                .map(|(ptr, _)| ptr.as_ptr())
-                                .unwrap_or(core::ptr::null_mut());
-
-                            let a = &new_node_ref.next;
-                            // copy the rest of the chain after the old node
-                            unsafe { a.store_ptr(next) };
-
-                            (ptr, match_ptr.as_ptr(), guard)
-                        }
-                        Err(root_guard) => {
-                            // No key matched ours, add to chain by putting new_node first
-                            // Chain the old root onto new_node
-                            unsafe { new_node_ref.next.store_ptr(root_node.as_ptr()) };
-                            (&bucket.0, root_node.as_ptr(), root_guard)
+                                (ptr, match_ptr.as_ptr(), guard)
+                            }
+                            Err(root_guard) => {
+                                println!("no matching key... chaining");
+                                // No key matched ours, add to chain by putting new_node first
+                                // Chain the old root onto new_node
+                                unsafe { new_node.next.store_ptr(root_node.as_ptr()) };
+                                (&bucket.0, root_node.as_ptr(), root_guard)
+                            }
                         }
                     }
-                }
-                None => {
-                    // Bucket is empty, simply swap in node
-                    (&bucket.0, core::ptr::null_mut(), guard)
+                    None => {
+                        println!("found empty node");
+                        // Bucket is empty, simply swap in node
+                        (&bucket.0, core::ptr::null_mut(), guard)
+                    }
                 }
             };
 
-            match ptr.compare_exchange_weak(current, new_node.take().unwrap()) {
+            dbg!();
+            match unsafe { ptr.compare_exchange_weak_ptr(current, new_node) } {
                 Ok(_old) => {
+                    println!("Swapped {:?} to {:?}", current, new_node);
                     // Need to handle old
                     break None;
                 }
                 Err(prev) => {
+                    println!("fialed to swap {:?} to {:?}", current, new_node);
+                    // Reset the next pointer because it might need to change next time
+                    let new_node = unsafe { &*new_node };
+                    unsafe { new_node.next.store_ptr(std::ptr::null_mut()) };
+                    println!("real value is {:?}", prev);
                     // Try again
-                    new_node = Some(prev);
                 }
             }
-            let _ = second_guard;
         }
     }
 
@@ -218,7 +223,7 @@ where
         hash as usize % self.buckets.len()
     }
 
-    fn iter(&self) -> Iter<'_, K, V> {
+    pub fn iter(&self) -> Iter<'_, K, V> {
         Iter {
             domain: &self.domain,
             buckets: &self.buckets,
@@ -228,7 +233,36 @@ where
     }
 }
 
-struct Iter<'m, K, V>
+impl<K, V> Drop for EasyMap<K, V>
+where
+    K: Hash + Eq + Send + Sync,
+    V: Send + Sync,
+{
+    fn drop(&mut self) {
+        for bucket in self.buckets.iter() {
+            // SAFETY: the pointer will not be modified
+            let mut ptr = unsafe { bucket.0.as_std() }.load(Ordering::Relaxed);
+            while !ptr.is_null() {
+                // load the next pointer to free before retiring this one to avoid UB
+                let next_ptr = {
+                    // We have exclusive access to self, so nobody can access `ptr`
+                    let r = unsafe { &*ptr };
+                    // SAFETY: the pointer will not be modified
+                    unsafe { r.next.as_std() }.load(Ordering::Relaxed)
+                };
+                // SAFETY:
+                // 1. We have exclusive access to self, so nobody else can guard `ptr`
+                // 2. `ptr` has not already been retired because it is still in the data structure
+                // 3. `ptr` points to a valid Node, created by Box
+                unsafe { self.domain.retire_ptr::<_, Box<Node<K, V>>>(ptr) };
+                println!("Dropping {:?}", ptr);
+                ptr = next_ptr;
+            }
+        }
+    }
+}
+
+pub struct Iter<'m, K, V>
 where
     K: Hash + Eq + Send + Sync + Debug,
     V: Send + Sync + Debug,
@@ -283,23 +317,35 @@ where
 #[cfg(test)]
 mod tests {
     use crate::*;
+    use itertools::Itertools;
 
     #[test]
     fn feels_good() {
         let map = EasyMap::<&'static str, u32>::with_capacity(1);
-        map.print_state();
+        let assert_same = |expected: &[(&str, u32)]| {
+            let got = map.iter().collect_vec();
+            let mut got = got.into_iter().map(|(k, v)| (*k, *v)).collect_vec();
+            got.sort();
+            let mut expected = Vec::from(expected);
+            expected.sort();
+
+            assert_eq!(got, expected);
+        };
+        assert_same(&[]);
         map.insert("Troy", 5);
-        map.print_state();
+        assert_same(&[("Troy", 5)]);
         map.insert("Jane", 15);
-        map.print_state();
+        assert_same(&[("Jane", 15), ("Troy", 5)]);
         map.insert("David", 20);
-        map.print_state();
+        assert_same(&[("David", 20), ("Jane", 15), ("Troy", 5)]);
         map.insert("Troy", 10);
-        map.print_state();
+        assert_same(&[("David", 20), ("Jane", 15), ("Troy", 10)]);
         map.insert("Jane", 0);
-        map.print_state();
-        let all: Vec<_> = map.iter().collect();
-        println!("{:?}", all);
+        assert_same(&[("David", 20), ("Jane", 0), ("Troy", 10)]);
+        map.insert("David", 0);
+        assert_same(&[("David", 0), ("Jane", 0), ("Troy", 10)]);
+        map.insert("Troy", 0);
+        assert_same(&[("David", 0), ("Jane", 0), ("Troy", 0)]);
 
         // assert_eq!(map.get("Troy"), Some(5));
         // assert_eq!(map.get("Jane"), Some(15));
