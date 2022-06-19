@@ -1,0 +1,10 @@
+error[E0597]: `map` does not live long enough
+ --> tests/compile_fail/bad_lifetimes.rs:5:9
+  |
+2 |     let r = {
+  |         - borrow later stored here
+...
+5 |         map.get(&0)
+  |         ^^^^^^^^^^^ borrowed value does not live long enough
+6 |     };
+  |     - `map` dropped here while still borrowed

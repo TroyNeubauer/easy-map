@@ -3,7 +3,7 @@
 //! A concurrent hashmap with chaining powered by haphazard
 
 mod node_wrapper;
-pub use node_wrapper::NodeWrapper;
+pub use node_wrapper::{NodeBox, NodeRef};
 
 use std::fmt::Debug;
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -44,7 +44,7 @@ where
     buckets: Box<[Bucket<K, V>]>,
 
     /// Stores the number of non-null nodes in buckets
-    in_use: AtomicUsize,
+    node_count: AtomicUsize,
 }
 
 impl<K, V> EasyMap<K, V>
@@ -68,7 +68,7 @@ where
         Self {
             domain: haphazard::Domain::new(&Family),
             buckets: buckets.into_boxed_slice(),
-            in_use: AtomicUsize::new(0),
+            node_count: AtomicUsize::new(0),
             build_hasher: ahash::RandomState::new(),
         }
     }
@@ -77,7 +77,7 @@ where
     ///
     /// `ptr` is an a pointer in a bucket's linked list.
     /// `guard` is a hazardpointer guard which protects `ptr`
-    /// `bucket` was derieved from the last read of `ptr`
+    /// `node_ptr` was derieved from the last read of `ptr`
     ///
     /// Returns `Ok(ptr, guard, node)` of the attributes of the matching node, or `Err(guard)` if
     /// no matching key is found. The returned guard in this case is the same guard passed in
@@ -123,7 +123,7 @@ where
 
     /// Inserts a new key-value pair into the map concurrently, returning the old value associated
     /// with the key (if any)
-    pub fn insert(&self, key: K, value: V) -> Option<NodeWrapper<K, V>> {
+    pub fn insert(&self, key: K, value: V) -> Option<NodeBox<K, V>> {
         // SAFETY: `p` is null
         let next = unsafe { AtomicPtr::new(std::ptr::null_mut()) };
         let new_node = Box::into_raw(Box::new(Node { key, value, next }));
@@ -135,6 +135,7 @@ where
         };
         let bucket = &self.buckets[index];
 
+        // TODO: Handle rehash
         loop {
             let (ptr, current, _guard, garbage_owned) = {
                 println!("getting hazard pointer");
@@ -177,6 +178,7 @@ where
 
             match unsafe { ptr.compare_exchange_weak_ptr(current, new_node) } {
                 Ok(now_garbage) => {
+                    self.node_count.fetch_add(1, Ordering::Relaxed);
                     if garbage_owned {
                         println!("Swapped out garbage {:?}", now_garbage);
                         break now_garbage.map(|replaced| {
@@ -185,7 +187,7 @@ where
                             // 2. Us and only us, swapped `replaced` out of the map,
                             //    so it is impossible for it to be retired already
                             // 3. All current readers of `replaced` are using HazardPointers
-                            unsafe { NodeWrapper::new(replaced, &self.domain) }
+                            unsafe { NodeBox::new(replaced, &self.domain) }
                         });
                     } else {
                         println!("Swapped out garbage, but this is inconsequential");
@@ -200,6 +202,101 @@ where
                     println!("real value is {:?}", prev);
                     // Try again
                 }
+            }
+        }
+    }
+
+    /// Removes the value that matches `key` or `None` if `key` is not in the map
+    pub fn remove(&self, key: &K) -> Option<NodeBox<K, V>> {
+        let index = self.index_for_key(key);
+        let bucket = &self.buckets[index];
+
+        // TODO: Handle rehash
+        loop {
+            println!("getting hazard pointer");
+            let mut guard = HazardPointer::new_in_domain(&self.domain);
+            let maybe_root_node = bucket.0.protect_ptr(&mut guard);
+            println!("protected hazard pointer");
+
+            match maybe_root_node {
+                Some((root_node, _)) => {
+                    match self.find_matching_key(&bucket.0, guard, root_node, key) {
+                        Ok((ptr, _guard, match_ptr)) => {
+                            println!("found matching key");
+                            // link `match_ptr` out of the chain
+                            let next = unsafe { match_ptr.as_ref() }.next.load_ptr();
+
+                            match unsafe { ptr.compare_exchange_weak_ptr(match_ptr.as_ptr(), next) }
+                            {
+                                Ok(now_garbage) => {
+                                    println!("Swapped out garbage {:?}", now_garbage);
+                                    self.node_count.fetch_sub(1, Ordering::Relaxed);
+                                    return now_garbage.map(|replaced| {
+                                        // SAFETY:
+                                        // 1. We have removed `replaced` from the map so it is no longer acessible
+                                        // 2. Us and only us, swapped `replaced` out of the map,
+                                        //    so it is impossible for it to be retired already
+                                        // 3. All current readers of `replaced` are using HazardPointers
+                                        unsafe { NodeBox::new(replaced, &self.domain) }
+                                    });
+                                }
+                                Err(_was) => {
+                                    println!(
+                                        "fialed to remove {:?} could not swap to {:?}",
+                                        match_ptr, next
+                                    );
+                                    // Try again
+                                }
+                            }
+                        }
+                        Err(_guard) => {
+                            // Not found
+                            return None;
+                        }
+                    }
+                }
+                None => {
+                    // Not found in map
+                    return None;
+                }
+            }
+        }
+    }
+
+    /// Looks up the value associated with `key` or returns `None` if `key` is not in the map
+    pub fn get(&self, key: &K) -> Option<NodeRef<'_, K, V>> {
+        let index = self.index_for_key(key);
+        let bucket = &self.buckets[index];
+
+        // TODO: Handle rehash
+        println!("getting hazard pointer");
+        let mut guard = HazardPointer::new_in_domain(&self.domain);
+        let maybe_root_node = bucket.0.protect_ptr(&mut guard);
+        println!("protected hazard pointer");
+
+        match maybe_root_node {
+            Some((root_node, _)) => {
+                match self.find_matching_key(&bucket.0, guard, root_node, key) {
+                    Ok((_ptr, guard, match_ptr)) => {
+                        println!("found matching key");
+
+                        // SAFETY:
+                        // `match_ptr` is the most recent load of `_ptr` using `guard`
+                        // 1. These are either `guard` at the start of the loop and
+                        //    `maybe_root_node`
+                        // 2. Or they are derived from a read of the same level inside
+                        //    `find_matching_key`
+                        return Some(unsafe { NodeRef::new(match_ptr, guard) });
+                    }
+                    Err(_guard) => {
+                        // Not found
+                        return None;
+                    }
+                }
+            }
+            None => {
+                // Not found in map
+                return None;
             }
         }
     }
@@ -352,88 +449,6 @@ where
                 }
                 None => self.next(),
             }
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::{collections::HashMap, ops::Deref};
-
-    use crate::*;
-    use itertools::Itertools;
-
-    #[test]
-    fn feels_good() {}
-
-    #[test]
-    fn insert() {
-        let map = EasyMap::<&'static str, u32>::with_capacity(1);
-        let assert_same = |expected: &[(&str, u32)]| {
-            let got = map.iter().collect_vec();
-            let mut got = got.into_iter().map(|(k, v)| (*k, *v)).collect_vec();
-            got.sort();
-            let mut expected = Vec::from(expected);
-            expected.sort();
-
-            assert_eq!(got, expected);
-        };
-        assert_same(&[]);
-        map.insert("Troy", 5);
-        assert_same(&[("Troy", 5)]);
-        map.insert("Jane", 15);
-        assert_same(&[("Jane", 15), ("Troy", 5)]);
-        map.insert("David", 20);
-        assert_same(&[("David", 20), ("Jane", 15), ("Troy", 5)]);
-        map.insert("Troy", 10);
-        assert_same(&[("David", 20), ("Jane", 15), ("Troy", 10)]);
-        map.insert("Jane", 0);
-        assert_same(&[("David", 20), ("Jane", 0), ("Troy", 10)]);
-        map.insert("David", 0);
-        assert_same(&[("David", 0), ("Jane", 0), ("Troy", 10)]);
-        map.insert("Troy", 0);
-        assert_same(&[("David", 0), ("Jane", 0), ("Troy", 0)]);
-
-        // assert_eq!(map.get("Troy"), Some(5));
-        // assert_eq!(map.get("Jane"), Some(15));
-        // assert_eq!(map.get("David"), Some(20));
-    }
-
-    #[test]
-    fn same_as_std_hashmap() {
-        use rand::{distributions::Alphanumeric, Rng, RngCore, SeedableRng};
-        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0u64);
-        let mut std = HashMap::new();
-        let our_map = EasyMap::new();
-
-        let mut keys = Vec::new();
-
-        for _ in 0..12 {
-            keys.push(
-                (&mut rng)
-                    .sample_iter(&Alphanumeric)
-                    .take(10)
-                    .map(char::from)
-                    .collect::<String>(),
-            )
-        }
-        for _ in 0..128 {
-            match rng.next_u64() % 1 {
-                0 => {
-                    let key = keys[rng.next_u64() as usize % keys.len()].clone();
-                    let value = rng.next_u64();
-                    let theirs = std.insert(key.clone(), value);
-                    let ours = our_map.insert(key, value).map(|o| o.deref().value);
-                    assert_eq!(ours, theirs);
-                }
-                _ => unreachable!(),
-            }
-
-            let mut ours: Vec<_> = our_map.iter().collect();
-            let mut theirs: Vec<_> = std.iter().collect();
-            ours.sort();
-            theirs.sort();
-            assert_eq!(ours, theirs);
         }
     }
 }
