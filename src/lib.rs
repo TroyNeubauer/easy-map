@@ -1,6 +1,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(missing_docs)]
-//! A concurrent hashmap with chaining powered by haphazard
+//! A concurrent hashmap with chaining powered by haphazard.
+//!
+//! When collisions occur, items within the same bucket are chained linearally into an atomic
+//! linked list
 
 mod node_wrapper;
 pub use node_wrapper::{NodeBox, NodeRef};
