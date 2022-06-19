@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-haphazard = { path = "../haphazard/" }
+haphazard = { git = "https://github.com/TroyNeubauer/haphazard", branch = "protect-ptr" }
 ahash = "0.7.6"
 
 [target.'cfg(loom)'.dependencies]
